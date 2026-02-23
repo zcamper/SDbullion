@@ -211,6 +211,24 @@ def get_next_page_url(html: str, base_url: str) -> str | None:
     return None
 
 
+def init_session(proxies: dict) -> Session:
+    """Create an HTTP session with Chrome TLS impersonation and warm it up
+    by visiting the homepage to establish WAF cookies."""
+    http = Session(impersonate="chrome110")
+
+    # Visit homepage to get WAF session cookies (required before other pages)
+    home_resp = http.get("https://www.sdbullion.com/", proxies=proxies, timeout=30)
+    Actor.log.info(f"Homepage warm-up: status={home_resp.status_code}, cookies={len(http.cookies)}")
+
+    if home_resp.status_code != 200:
+        Actor.log.warning(f"Homepage returned {home_resp.status_code}, scraping may fail")
+
+    # Set Referer for all subsequent requests (WAF checks this)
+    http.headers.update({'Referer': 'https://www.sdbullion.com/'})
+
+    return http
+
+
 async def scrape_listing(http: Session, url: str, proxies: dict, max_items: int) -> None:
     """Scrape a search or category listing page and follow pagination."""
     global products_scraped
@@ -223,23 +241,16 @@ async def scrape_listing(http: Session, url: str, proxies: dict, max_items: int)
 
         try:
             response = http.get(current_url, proxies=proxies, timeout=30)
-            Actor.log.info(f"Listing response: status={response.status_code}, length={len(response.text)}")
         except Exception as e:
             Actor.log.error(f"Failed to fetch listing {current_url}: {e}")
             break
 
         if response.status_code != 200:
             Actor.log.warning(f"Non-200 status ({response.status_code}) for listing {current_url}")
-            Actor.log.info(f"Response preview: {response.text[:500]}")
             break
 
         products = extract_listing_products(response.text, current_url)
         Actor.log.info(f"Found {len(products)} products on listing page {page_num}")
-
-        # Log sample URLs for debugging
-        for p in products[:3]:
-            sample_url = p['url']
-            Actor.log.info(f"  Sample: {sample_url} -> is_product={is_product_url(sample_url)}")
 
         skipped = 0
         for product in products:
@@ -254,21 +265,54 @@ async def scrape_listing(http: Session, url: str, proxies: dict, max_items: int)
                 continue
             scraped_urls.add(prod_url)
 
-            price_text = product.get('price')
-            await Actor.push_data({
-                'url': prod_url,
-                'name': product.get('name', ''),
-                'price': price_text if price_text and '$' in str(price_text) else None,
-                'priceNumeric': parse_price(price_text) if price_text else None,
-                'imageUrl': product.get('image'),
-                'sku': None,
-                'availability': None,
-                'description': None,
-                'scrapedAt': datetime.now(timezone.utc).isoformat(),
-            })
+            # Fetch the full product page for detailed data
+            try:
+                prod_resp = http.get(prod_url, proxies=proxies, timeout=30)
+                if prod_resp.status_code == 200:
+                    details = extract_product_details(prod_resp.text)
+                    await Actor.push_data({
+                        'url': prod_url,
+                        'name': details['name'] or product.get('name', ''),
+                        'price': details['price'] or (product.get('price') if product.get('price') and '$' in str(product.get('price')) else None),
+                        'priceNumeric': details['priceNumeric'] or parse_price(product.get('price')),
+                        'imageUrl': details['imageUrl'] or product.get('image'),
+                        'sku': details['sku'],
+                        'availability': details['availability'],
+                        'description': details['description'],
+                        'scrapedAt': datetime.now(timezone.utc).isoformat(),
+                    })
+                else:
+                    # Fall back to listing data if product page fails
+                    Actor.log.warning(f"Product page {prod_url} returned {prod_resp.status_code}, using listing data")
+                    price_text = product.get('price')
+                    await Actor.push_data({
+                        'url': prod_url,
+                        'name': product.get('name', ''),
+                        'price': price_text if price_text and '$' in str(price_text) else None,
+                        'priceNumeric': parse_price(price_text) if price_text else None,
+                        'imageUrl': product.get('image'),
+                        'sku': None,
+                        'availability': None,
+                        'description': None,
+                        'scrapedAt': datetime.now(timezone.utc).isoformat(),
+                    })
+            except Exception as e:
+                Actor.log.warning(f"Failed to fetch product {prod_url}: {e}, using listing data")
+                price_text = product.get('price')
+                await Actor.push_data({
+                    'url': prod_url,
+                    'name': product.get('name', ''),
+                    'price': price_text if price_text and '$' in str(price_text) else None,
+                    'priceNumeric': parse_price(price_text) if price_text else None,
+                    'imageUrl': product.get('image'),
+                    'sku': None,
+                    'availability': None,
+                    'description': None,
+                    'scrapedAt': datetime.now(timezone.utc).isoformat(),
+                })
 
             products_scraped += 1
-            Actor.log.info(f"Scraped {products_scraped}/{max_items} products (from listing)")
+            Actor.log.info(f"Scraped {products_scraped}/{max_items} products")
 
         if skipped:
             Actor.log.info(f"Skipped {skipped} non-product URLs")
@@ -374,54 +418,10 @@ async def main():
         )
 
         proxy_url = await proxy_configuration.new_url()
-        masked = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy_url or '')
-        Actor.log.info(f"Proxy URL (masked): {masked}")
         proxies = {"http": proxy_url, "https": proxy_url}
 
-        # Create HTTP session with Chrome TLS fingerprint impersonation.
-        # This bypasses WAF TLS fingerprinting that blocks Playwright browsers.
-        http = Session(impersonate="chrome110")
-        Actor.log.info("Created curl_cffi session with chrome110 TLS impersonation")
-
-        # Verify proxy connectivity
-        try:
-            test_resp = http.get("https://httpbin.org/ip", proxies=proxies, timeout=10)
-            Actor.log.info(f"Proxy verification — IP: {test_resp.text.strip()}")
-        except Exception as e:
-            Actor.log.warning(f"Proxy verification failed: {e}")
-
-        # Warm up session: visit homepage first to establish cookies/session.
-        # Many WAFs require an initial visit to set tracking cookies before
-        # allowing access to deeper pages like search results.
-        Actor.log.info("Warming up session by visiting homepage...")
-        try:
-            home_resp = http.get("https://www.sdbullion.com/", proxies=proxies, timeout=30)
-            Actor.log.info(f"Homepage response: status={home_resp.status_code}, length={len(home_resp.text)}, cookies={len(http.cookies)}")
-            Actor.log.info(f"Homepage body: {home_resp.text[:500]}")
-            # Log cookies
-            try:
-                cookie_dict = dict(http.cookies)
-                Actor.log.info(f"Cookies received: {list(cookie_dict.keys())}")
-            except Exception:
-                Actor.log.info(f"Cookies (raw): {http.cookies}")
-            # Set Referer header for all subsequent requests (WAFs check this)
-            http.headers.update({
-                'Referer': 'https://www.sdbullion.com/',
-            })
-            # Diagnostic: test search, category, and product URLs to see which are blocked
-            test_urls = [
-                ("search", "https://www.sdbullion.com/catalogsearch/result/?q=Silver+coin"),
-                ("category", "https://www.sdbullion.com/silver/"),
-                ("product", "https://www.sdbullion.com/2025-1-oz-american-silver-eagle-coin-bu"),
-            ]
-            for label, test_url in test_urls:
-                try:
-                    test_resp = http.get(test_url, proxies=proxies, timeout=15)
-                    Actor.log.info(f"  {label} test: status={test_resp.status_code}, length={len(test_resp.text)}")
-                except Exception as e:
-                    Actor.log.info(f"  {label} test failed: {e}")
-        except Exception as e:
-            Actor.log.warning(f"Homepage warm-up failed: {e}")
+        # Initialize HTTP session with Chrome TLS impersonation + homepage warm-up
+        http = init_session(proxies)
 
         # Process start URLs
         for url in start_urls:

@@ -362,22 +362,16 @@ async def main():
 
         Actor.log.info(f"Starting SD Bullion Scraper with {len(start_urls)} start URLs, max_items={max_items}")
 
-        # Set up proxy — SD Bullion WAF requires residential proxies
-        proxy_input = actor_input.get('proxyConfiguration')
-        if proxy_input and proxy_input.get('apifyProxyGroups'):
-            Actor.log.info(f"Using user-provided proxy config: {proxy_input}")
-            proxy_configuration = await Actor.create_proxy_configuration(
-                actor_proxy_input=proxy_input,
-            )
-        else:
-            Actor.log.info("Forcing RESIDENTIAL proxy with US country (required for SD Bullion WAF)")
-            proxy_configuration = await Actor.create_proxy_configuration(
-                actor_proxy_input={
-                    'useApifyProxy': True,
-                    'apifyProxyGroups': ['RESIDENTIAL'],
-                    'apifyProxyCountry': 'US',
-                },
-            )
+        # Set up proxy — SD Bullion requires US residential proxies.
+        # Always force US country since SD Bullion geo-blocks non-US traffic.
+        Actor.log.info("Configuring RESIDENTIAL proxy with US country (required for SD Bullion)")
+        proxy_configuration = await Actor.create_proxy_configuration(
+            actor_proxy_input={
+                'useApifyProxy': True,
+                'apifyProxyGroups': ['RESIDENTIAL'],
+                'apifyProxyCountry': 'US',
+            },
+        )
 
         proxy_url = await proxy_configuration.new_url()
         masked = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy_url or '')
@@ -403,12 +397,22 @@ async def main():
         try:
             home_resp = http.get("https://www.sdbullion.com/", proxies=proxies, timeout=30)
             Actor.log.info(f"Homepage response: status={home_resp.status_code}, length={len(home_resp.text)}, cookies={len(http.cookies)}")
-            if http.cookies:
-                cookie_names = [c.name for c in http.cookies]
-                Actor.log.info(f"Cookies received: {cookie_names}")
-            # Log what headers curl_cffi actually sends
-            debug_resp = http.get("https://httpbin.org/headers", proxies=proxies, timeout=10)
-            Actor.log.info(f"Request headers being sent: {debug_resp.text.strip()[:500]}")
+            Actor.log.info(f"Homepage body: {home_resp.text[:500]}")
+            # Log cookies
+            try:
+                cookie_dict = dict(http.cookies)
+                Actor.log.info(f"Cookies received: {list(cookie_dict.keys())}")
+            except Exception:
+                Actor.log.info(f"Cookies (raw): {http.cookies}")
+            # If homepage returned 403, try again (some WAFs need cookie + retry)
+            if home_resp.status_code == 403 and len(http.cookies) > 0:
+                Actor.log.info("Retrying homepage with cookies...")
+                import time
+                time.sleep(2)
+                home_resp2 = http.get("https://www.sdbullion.com/", proxies=proxies, timeout=30)
+                Actor.log.info(f"Homepage retry: status={home_resp2.status_code}, length={len(home_resp2.text)}")
+                if home_resp2.status_code != 403:
+                    Actor.log.info(f"Homepage retry body preview: {home_resp2.text[:300]}")
         except Exception as e:
             Actor.log.warning(f"Homepage warm-up failed: {e}")
 

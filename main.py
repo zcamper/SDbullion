@@ -1,14 +1,11 @@
 import asyncio
 import re
-import types
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus, urlparse
+from datetime import datetime, timezone
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from apify import Actor
-from crawlee import ConcurrencySettings, Request
-from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
-from crawlee.errors import SessionError
-from crawlee.router import Router
+from bs4 import BeautifulSoup
+from curl_cffi.requests import Session
 
 SDBULLION_HOST = 'sdbullion.com'
 SDBULLION_HOSTS = {'sdbullion.com', 'www.sdbullion.com'}
@@ -17,79 +14,6 @@ CATEGORY_PATH_KEYWORDS = ['/gold/', '/silver/', '/platinum/', '/palladium/', '/c
 AVAILABILITY_STATES = ['In Stock', 'Out of Stock', 'Pre-Order', 'Sold Out', 'Coming Soon', 'Discontinued']
 MAX_DESCRIPTION_LENGTH = 2000
 SKIP_PATH_SEGMENTS = ['/about/', '/shipping/', '/contact/', '/faq/', '/policies/', '/blog/', '/customer/', '/checkout/', '/cart/']
-
-# JS snippet to extract product cards from Magento 2 listing/search pages.
-# Tries multiple selector strategies to find product name, price, and URL.
-EXTRACT_LISTING_PRODUCTS_JS = '''() => {
-    const products = [];
-    const seen = new Set();
-
-    // Strategy 1: Magento 2 product-item selectors
-    document.querySelectorAll('.product-item, .product-item-info, .item.product.product-item').forEach(el => {
-        const link = el.querySelector('a.product-item-link, a.product-item-photo, a[href]');
-        const nameEl = el.querySelector('.product-item-link, .product-item-name, .product.name a, h2 a, h3 a');
-        const priceEl = el.querySelector('.price-box .price, .price-wrapper .price, .price, [data-price-type="finalPrice"] .price');
-        const imgEl = el.querySelector('img.product-image-photo, img[src]');
-        if (link && (nameEl || link.title)) {
-            const url = link.href;
-            if (!seen.has(url)) {
-                seen.add(url);
-                products.push({
-                    url: url,
-                    name: nameEl ? nameEl.innerText.trim() : (link.title || '').trim(),
-                    price: priceEl ? priceEl.innerText.trim() : null,
-                    image: imgEl ? (imgEl.src || imgEl.dataset.src || null) : null
-                });
-            }
-        }
-    });
-
-    // Strategy 2: Generic product grid/list fallbacks
-    if (products.length === 0) {
-        document.querySelectorAll('.products-grid .product-item, .products.list .product-item, [class*="product"] li, [class*="product-list"] > div').forEach(el => {
-            const link = el.querySelector('a[href*="sdbullion"]');
-            const nameEl = el.querySelector('h2, h3, h4, [class*="name"], [class*="title"], a[class*="link"]');
-            const priceEl = el.querySelector('[class*="price"]');
-            const imgEl = el.querySelector('img[src], img[data-src]');
-            if (link && nameEl) {
-                const url = link.href;
-                if (!seen.has(url)) {
-                    seen.add(url);
-                    products.push({
-                        url: url,
-                        name: nameEl.innerText.trim(),
-                        price: priceEl ? priceEl.innerText.trim() : null,
-                        image: imgEl ? (imgEl.src || imgEl.dataset.src || null) : null
-                    });
-                }
-            }
-        });
-    }
-
-    // Strategy 3: Any product link with price nearby
-    if (products.length === 0) {
-        document.querySelectorAll('a[href*="sdbullion"]').forEach(link => {
-            const url = link.href;
-            const name = (link.innerText || link.title || '').trim();
-            if (name && name.length > 5 && !seen.has(url) && !url.includes('/catalogsearch/') && !url.includes('/checkout/') && !url.includes('/customer/')) {
-                const parent = link.closest('div, li, article, section');
-                const priceEl = parent ? parent.querySelector('[class*="price"]') : null;
-                if (priceEl) {
-                    seen.add(url);
-                    const imgEl = parent ? parent.querySelector('img[src], img[data-src]') : null;
-                    products.push({
-                        url: url,
-                        name: name,
-                        price: priceEl ? priceEl.innerText.trim() : null,
-                        image: imgEl ? (imgEl.src || imgEl.dataset.src || null) : null
-                    });
-                }
-            }
-        });
-    }
-
-    return products;
-}'''
 
 products_scraped = 0
 scraped_urls: set[str] = set()
@@ -108,27 +32,14 @@ def parse_price(price_str: str) -> float | None:
     return None
 
 
-def is_product_url(url: str) -> bool:
-    """Check if a URL looks like a product page (not category, search, or informational)."""
-    if not validate_url(url):
+def validate_url(url: str) -> bool:
+    """Validate that a URL is well-formed and belongs to sdbullion.com."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ''
+        return parsed.scheme in ('http', 'https') and host in SDBULLION_HOSTS
+    except Exception:
         return False
-    if is_search_url(url):
-        return False
-    if any(skip in url for skip in SKIP_PATH_SEGMENTS):
-        return False
-    parsed = urlparse(url)
-    path = parsed.path.strip('/')
-    if not path:
-        return False
-    # Skip file extensions (images, etc.)
-    if '.' in path.rsplit('/', 1)[-1]:
-        return False
-    # SD Bullion product URLs can be single-segment (/2025-american-silver-eagle-coin)
-    # or multi-segment (/silver/us-mint-american-silver-eagle-coins/silver-american-eagles-1-ounce)
-    # If it's not a category URL, treat it as a product
-    if not is_category_url(url):
-        return True
-    return False
 
 
 def is_search_url(url: str) -> bool:
@@ -145,121 +56,271 @@ def is_category_url(url: str) -> bool:
     if not path:
         return True  # Homepage
     segments = [s for s in path.split('/') if s]
-    # Top-level metal categories are listing pages: /silver, /gold, /platinum, etc.
     top_level_categories = ('gold', 'silver', 'platinum', 'palladium', 'copper', 'on-sale', 'new-arrivals', 'specials')
     if len(segments) == 1 and segments[0] in top_level_categories:
         return True
-    # Two-segment category paths like /silver/silver-coins, /gold/gold-bars
     if len(segments) == 2 and segments[0] in top_level_categories:
-        # If second segment looks like a subcategory (contains the metal name or generic listing terms)
         sub = segments[1]
         if any(cat in sub for cat in ('coin', 'bar', 'round', 'bullion', 'mint', 'eagle', 'maple', 'all-')):
             return True
-    # Paths with 'inventory' or explicit category markers
     if 'inventory' in path:
         return True
     return False
 
 
-def validate_url(url: str) -> bool:
-    """Validate that a URL is well-formed and belongs to sdbullion.com."""
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ''
-        return parsed.scheme in ('http', 'https') and host in SDBULLION_HOSTS
-    except Exception:
+def is_product_url(url: str) -> bool:
+    """Check if a URL looks like a product page (not category, search, or informational)."""
+    if not validate_url(url):
         return False
+    if is_search_url(url):
+        return False
+    if any(skip in url for skip in SKIP_PATH_SEGMENTS):
+        return False
+    parsed = urlparse(url)
+    path = parsed.path.strip('/')
+    if not path:
+        return False
+    if '.' in path.rsplit('/', 1)[-1]:
+        return False
+    if not is_category_url(url):
+        return True
+    return False
 
 
-async def dismiss_overlays(page) -> None:
-    """Dismiss cookie consent banners and other overlays that block interaction."""
-    dismiss_selectors = [
-        'button:has-text("Accept")',
-        'button:has-text("Allow all")',
-        'button:has-text("Allow All")',
-        'button:has-text("Got it")',
-        'button:has-text("I agree")',
-        'button:has-text("OK")',
-        'button:has-text("Close")',
-        '[class*="cookie"] button',
-        '[class*="consent"] button',
-        '[id*="cookie"] button',
-        '[id*="consent"] button',
-        '.onetrust-close-btn-handler',
-        '#onetrust-accept-btn-handler',
-        # Magento-specific overlay dismissals
-        '.modals-overlay + .modal-popup button.action-close',
-        '.modal-popup .action-close',
-        'button.action-close',
-    ]
-    for selector in dismiss_selectors:
-        try:
-            btn = await page.query_selector(selector)
-            if btn and await btn.is_visible():
-                await btn.click()
-                Actor.log.info(f"Dismissed overlay with selector: {selector}")
-                await page.wait_for_timeout(500)
-                return
-        except Exception:
+def extract_listing_products(html: str, base_url: str) -> list[dict]:
+    """Extract products from a Magento 2 listing page HTML."""
+    soup = BeautifulSoup(html, 'html.parser')
+    products = []
+    seen = set()
+
+    # Strategy 1: Magento 2 product-item selectors
+    for item in soup.select('.product-item, .product-item-info'):
+        link_el = (
+            item.select_one('a.product-item-link')
+            or item.select_one('a.product-item-photo')
+            or item.select_one('a[href]')
+        )
+        if not link_el:
             continue
 
+        url = urljoin(base_url, link_el.get('href', ''))
+        if url in seen:
+            continue
+        seen.add(url)
 
-async def extract_products_from_listing(context: PlaywrightCrawlingContext, max_items: int, source_type: str) -> int:
-    """Extract product data directly from a listing/search page. Returns count of products scraped."""
-    global products_scraped
+        name_el = item.select_one('.product-item-link, .product-item-name a, h2 a, h3 a')
+        name = name_el.get_text(strip=True) if name_el else (link_el.get('title', '') or link_el.get_text(strip=True))
 
-    listing_products = await context.page.evaluate(EXTRACT_LISTING_PRODUCTS_JS)
+        price_el = item.select_one('.price-box .price, [data-price-type="finalPrice"] .price, .price-wrapper .price, .price')
+        price = price_el.get_text(strip=True) if price_el else None
 
-    if not listing_products:
-        Actor.log.info(f"No products found via JS extraction on {source_type} page, will enqueue links as fallback")
-        return 0
+        img_el = item.select_one('img.product-image-photo, img[src]')
+        image = None
+        if img_el:
+            image = img_el.get('src') or img_el.get('data-src')
 
-    Actor.log.info(f"Found {len(listing_products)} products on {source_type} page via JS extraction")
+        if name:
+            products.append({'url': url, 'name': name, 'price': price, 'image': image})
 
-    # Log sample URLs for debugging classification
-    sample_urls = [p.get('url', '') for p in listing_products[:3]]
-    for sample_url in sample_urls:
-        Actor.log.info(f"  Sample URL: {sample_url} -> is_product={is_product_url(sample_url)}, is_category={is_category_url(sample_url)}, is_search={is_search_url(sample_url)}")
+    # Strategy 2: Broader product grid fallback
+    if not products:
+        for item in soup.select('.products-grid li, .products.list .item, ol.product-items > li'):
+            link_el = item.select_one('a[href]')
+            if not link_el:
+                continue
+            url = urljoin(base_url, link_el.get('href', ''))
+            if url in seen:
+                continue
+            seen.add(url)
 
-    count = 0
-    skipped_urls = []
-    for product in listing_products:
-        if products_scraped >= max_items:
+            name = link_el.get_text(strip=True) or link_el.get('title', '')
+            price_el = item.select_one('[class*="price"]')
+            price = price_el.get_text(strip=True) if price_el else None
+
+            img_el = item.select_one('img[src]')
+            image = img_el.get('src') if img_el else None
+
+            if name and len(name) > 3:
+                products.append({'url': url, 'name': name, 'price': price, 'image': image})
+
+    return products
+
+
+def extract_product_details(html: str) -> dict:
+    """Extract product details from a Magento 2 product page HTML."""
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # Name
+    h1 = soup.select_one('h1')
+    name = h1.get_text(strip=True) if h1 else None
+
+    # Price
+    price_el = soup.select_one(
+        '.price-box .price, .product-info-price .price, '
+        '[data-price-type="finalPrice"] .price, .special-price .price, '
+        '.normal-price .price, span.price'
+    )
+    price_text = price_el.get_text(strip=True) if price_el else None
+
+    # Image — og:image first, then product gallery
+    og_image = soup.select_one('meta[property="og:image"]')
+    image_url = og_image.get('content') if og_image else None
+    if not image_url:
+        img_el = soup.select_one('.gallery-placeholder img, .fotorama__stage img, .product-image-photo')
+        image_url = img_el.get('src') if img_el else None
+
+    # SKU
+    sku_el = soup.select_one('[itemprop="sku"], .product.attribute.sku .value, .sku .value')
+    sku = sku_el.get_text(strip=True) if sku_el else None
+    if not sku:
+        meta_sku = soup.select_one('meta[itemprop="sku"]')
+        sku = meta_sku.get('content') if meta_sku else None
+
+    # Availability
+    availability = "Unknown"
+    page_text = soup.get_text()
+    for state in AVAILABILITY_STATES:
+        if state in page_text:
+            availability = state
             break
 
-        url = product.get('url', '').rstrip('/')
-        if not is_product_url(url):
-            skipped_urls.append(url)
-            continue
-        if url in scraped_urls:
-            continue
-        scraped_urls.add(url)
+    # Description
+    desc_el = soup.select_one(
+        '.product.attribute.description .value, '
+        '[itemprop="description"], #description .value'
+    )
+    description = desc_el.get_text(strip=True)[:MAX_DESCRIPTION_LENGTH] if desc_el else None
 
-        name = product.get('name', '')
-        price_text = product.get('price')
-        price_numeric = parse_price(price_text) if price_text and '$' in str(price_text) else None
-        image_url = product.get('image')
+    return {
+        'name': name,
+        'price': price_text if price_text and '$' in str(price_text) else None,
+        'priceNumeric': parse_price(price_text) if price_text else None,
+        'imageUrl': image_url,
+        'sku': sku,
+        'availability': availability,
+        'description': description,
+    }
 
-        await Actor.push_data({
-            'url': url,
-            'name': name,
-            'price': price_text if price_text and '$' in str(price_text) else None,
-            'priceNumeric': price_numeric,
-            'imageUrl': image_url,
-            'sku': None,
-            'availability': None,
-            'description': None,
-            'scrapedAt': datetime.now(timezone.utc).isoformat(),
-        })
 
-        products_scraped += 1
-        count += 1
-        Actor.log.info(f"Scraped {products_scraped}/{max_items} products (from {source_type} listing)")
+def get_next_page_url(html: str, base_url: str) -> str | None:
+    """Get the next page URL from Magento 2 pagination."""
+    soup = BeautifulSoup(html, 'html.parser')
+    next_link = soup.select_one('.pages a.next, a.action.next, .pages-items li.current + li a')
+    if next_link:
+        return urljoin(base_url, next_link.get('href', ''))
+    return None
 
-    if skipped_urls:
-        Actor.log.info(f"Skipped {len(skipped_urls)} non-product URLs, samples: {skipped_urls[:3]}")
 
-    return count
+async def scrape_listing(http: Session, url: str, proxies: dict, max_items: int) -> None:
+    """Scrape a search or category listing page and follow pagination."""
+    global products_scraped
+
+    page_num = 1
+    current_url = url
+
+    while current_url and products_scraped < max_items:
+        Actor.log.info(f"Fetching listing page {page_num}: {current_url}")
+
+        try:
+            response = http.get(current_url, proxies=proxies, timeout=30)
+            Actor.log.info(f"Listing response: status={response.status_code}, length={len(response.text)}")
+        except Exception as e:
+            Actor.log.error(f"Failed to fetch listing {current_url}: {e}")
+            break
+
+        if response.status_code != 200:
+            Actor.log.warning(f"Non-200 status ({response.status_code}) for listing {current_url}")
+            Actor.log.info(f"Response preview: {response.text[:500]}")
+            break
+
+        products = extract_listing_products(response.text, current_url)
+        Actor.log.info(f"Found {len(products)} products on listing page {page_num}")
+
+        # Log sample URLs for debugging
+        for p in products[:3]:
+            sample_url = p['url']
+            Actor.log.info(f"  Sample: {sample_url} -> is_product={is_product_url(sample_url)}")
+
+        skipped = 0
+        for product in products:
+            if products_scraped >= max_items:
+                break
+
+            prod_url = product['url'].rstrip('/')
+            if not is_product_url(prod_url):
+                skipped += 1
+                continue
+            if prod_url in scraped_urls:
+                continue
+            scraped_urls.add(prod_url)
+
+            price_text = product.get('price')
+            await Actor.push_data({
+                'url': prod_url,
+                'name': product.get('name', ''),
+                'price': price_text if price_text and '$' in str(price_text) else None,
+                'priceNumeric': parse_price(price_text) if price_text else None,
+                'imageUrl': product.get('image'),
+                'sku': None,
+                'availability': None,
+                'description': None,
+                'scrapedAt': datetime.now(timezone.utc).isoformat(),
+            })
+
+            products_scraped += 1
+            Actor.log.info(f"Scraped {products_scraped}/{max_items} products (from listing)")
+
+        if skipped:
+            Actor.log.info(f"Skipped {skipped} non-product URLs")
+
+        # Check for next page
+        next_url = get_next_page_url(response.text, current_url)
+        if next_url and next_url != current_url:
+            current_url = next_url
+            page_num += 1
+        else:
+            break
+
+
+async def scrape_product(http: Session, url: str, proxies: dict, max_items: int) -> None:
+    """Scrape a single product page."""
+    global products_scraped
+    if products_scraped >= max_items:
+        return
+
+    url = url.rstrip('/')
+    if url in scraped_urls:
+        return
+    scraped_urls.add(url)
+
+    Actor.log.info(f"Fetching product ({products_scraped + 1}/{max_items}): {url}")
+
+    try:
+        response = http.get(url, proxies=proxies, timeout=30)
+    except Exception as e:
+        Actor.log.error(f"Failed to fetch product {url}: {e}")
+        return
+
+    if response.status_code != 200:
+        Actor.log.warning(f"Non-200 status ({response.status_code}) for product {url}")
+        return
+
+    details = extract_product_details(response.text)
+
+    await Actor.push_data({
+        'url': url,
+        'name': details['name'],
+        'price': details['price'],
+        'priceNumeric': details['priceNumeric'],
+        'imageUrl': details['imageUrl'],
+        'sku': details['sku'],
+        'availability': details['availability'],
+        'description': details['description'],
+        'scrapedAt': datetime.now(timezone.utc).isoformat(),
+    })
+
+    products_scraped += 1
+    Actor.log.info(f"Scraped {products_scraped}/{max_items} products")
 
 
 async def main():
@@ -289,7 +350,6 @@ async def main():
             else:
                 Actor.log.warning(f"Skipping invalid start_urls entry: {item}")
                 continue
-
             if validate_url(url):
                 start_urls.append(url)
             else:
@@ -302,255 +362,7 @@ async def main():
 
         Actor.log.info(f"Starting SD Bullion Scraper with {len(start_urls)} start URLs, max_items={max_items}")
 
-        router = Router[PlaywrightCrawlingContext]()
-
-        @router.handler('PRODUCT')
-        async def product_handler(context: PlaywrightCrawlingContext):
-            global products_scraped
-            if products_scraped >= max_items:
-                return
-
-            url = context.request.url.rstrip('/')
-            if any(skip in url for skip in SKIP_PATH_SEGMENTS):
-                Actor.log.info(f"Skipping informational URL: {url}")
-                return
-            if is_category_url(url):
-                Actor.log.info(f"Skipping category URL in product handler: {url}")
-                return
-            if url in scraped_urls:
-                Actor.log.info(f"Skipping duplicate product: {url}")
-                return
-            scraped_urls.add(url)
-
-            Actor.log.info(f'Extracting product ({products_scraped + 1}/{max_items}): {url}')
-
-            try:
-                await context.page.wait_for_selector('h1', timeout=10000)
-            except Exception as e:
-                Actor.log.warning(f"Title not found for {url}: {e}")
-                return
-
-            name = await context.page.inner_text('h1')
-
-            # Price extraction — Magento 2 price-box selectors
-            price_text = None
-            price_selectors = [
-                '.price-box .price',
-                '.product-info-price .price',
-                '[data-price-type="finalPrice"] .price',
-                '.price-wrapper .price',
-                '.special-price .price',
-                '.normal-price .price',
-                'span.price',
-                '.price',
-            ]
-            for selector in price_selectors:
-                try:
-                    el = await context.page.query_selector(selector)
-                    if el:
-                        text = await el.inner_text()
-                        if text and '$' in text:
-                            price_text = text.strip()
-                            break
-                except Exception:
-                    continue
-
-            price_numeric = parse_price(price_text)
-
-            # Image extraction — Magento 2 gallery and og:image fallback
-            image_url = await context.page.evaluate('''() => {
-                const ogImage = document.querySelector('meta[property="og:image"]');
-                if (ogImage && ogImage.content) return ogImage.content;
-                const img = document.querySelector('.gallery-placeholder img, .fotorama__stage img, .product.media img, .product-image-photo, [class*="product"] img[src*="sdbullion"]');
-                if (img) return img.src || img.dataset.src || null;
-                return null;
-            }''')
-
-            # Availability detection
-            availability = "Unknown"
-            page_text = await context.page.content()
-            for state in AVAILABILITY_STATES:
-                if state in page_text:
-                    availability = state
-                    break
-
-            # SKU extraction — Magento 2 typically shows SKU on product pages
-            sku = await context.page.evaluate('''() => {
-                // Magento 2 standard SKU display
-                const skuEl = document.querySelector('[itemprop="sku"], .product.attribute.sku .value, .sku .value');
-                if (skuEl) return skuEl.innerText.trim();
-                // Try meta tag
-                const metaSku = document.querySelector('meta[itemprop="sku"]');
-                if (metaSku) return metaSku.content;
-                // Try table rows
-                const rows = Array.from(document.querySelectorAll('tr, .data-table tr'));
-                const skuRow = rows.find(r => {
-                    const text = r.innerText || '';
-                    return text.includes('SKU') || text.includes('Product ID');
-                });
-                if (skuRow) {
-                    const cells = skuRow.querySelectorAll('td');
-                    return cells.length > 1 ? cells[1].innerText.trim() : null;
-                }
-                return null;
-            }''')
-
-            # Description extraction
-            description = None
-            try:
-                desc_el = await context.page.query_selector('.product.attribute.description .value, .product.info.detailed .description .value, #description .value, [itemprop="description"]')
-                if not desc_el:
-                    # Try clicking the description tab first (Magento 2 tabs)
-                    desc_tab = await context.page.query_selector('a[href="#description"], a:has-text("Description"), [data-role="collapsible"]:has-text("Description")')
-                    if desc_tab:
-                        await desc_tab.click()
-                        await context.page.wait_for_timeout(500)
-                    desc_el = await context.page.query_selector('.product.attribute.description .value, .description .value, [itemprop="description"]')
-
-                if desc_el:
-                    raw = await desc_el.inner_text()
-                    if raw:
-                        description = raw.strip()[:MAX_DESCRIPTION_LENGTH]
-            except Exception as e:
-                Actor.log.warning(f'Error extracting description for {url}: {e}')
-
-            await Actor.push_data({
-                'url': url,
-                'name': name.strip() if name else None,
-                'price': price_text,
-                'priceNumeric': price_numeric,
-                'imageUrl': image_url,
-                'sku': sku.strip() if sku else None,
-                'availability': availability,
-                'description': description,
-                'scrapedAt': datetime.now(timezone.utc).isoformat(),
-            })
-
-            products_scraped += 1
-            Actor.log.info(f"Scraped {products_scraped}/{max_items} products")
-
-        @router.handler('SEARCH')
-        async def search_handler(context: PlaywrightCrawlingContext):
-            if products_scraped >= max_items:
-                return
-
-            url = context.request.url
-            Actor.log.info(f'Processing search results: {url}')
-
-            # Log response status and page title for diagnostics
-            try:
-                title = await context.page.title()
-                page_url = context.page.url
-                Actor.log.info(f"Page loaded — title: '{title}', final URL: {page_url}")
-                # Log first 300 chars of body text to see what we got
-                preview = await context.page.evaluate('() => document.body ? document.body.innerText.substring(0, 300) : "NO BODY"')
-                Actor.log.info(f"Page body preview (first 300 chars): {preview}")
-            except Exception as e:
-                Actor.log.warning(f"Could not get page diagnostics: {e}")
-
-            # Dismiss cookie consent / overlays that may block rendering
-            await dismiss_overlays(context.page)
-
-            # Magento 2 renders search results server-side, wait for product grid
-            magento_selectors = '.products-grid, .products.list, .product-items, .search.results'
-            found_grid = False
-            try:
-                await context.page.wait_for_selector(magento_selectors, timeout=15000)
-                found_grid = True
-            except Exception:
-                Actor.log.info("Magento product grid not found on first attempt, scrolling and waiting...")
-                await context.page.evaluate('window.scrollBy(0, 500)')
-                await context.page.wait_for_timeout(3000)
-                try:
-                    await context.page.wait_for_selector(magento_selectors, timeout=10000)
-                    found_grid = True
-                except Exception:
-                    Actor.log.info("Magento product grid still not found after scroll, trying with longer wait...")
-                    await context.page.wait_for_timeout(5000)
-
-            if found_grid:
-                Actor.log.info("Magento product grid detected")
-
-            # Try to extract products directly from the listing page
-            count = await extract_products_from_listing(context, max_items, 'search')
-
-            if count == 0:
-                # Log what's actually on the page for debugging
-                try:
-                    body_text = await context.page.evaluate('() => document.body.innerText.substring(0, 500)')
-                    Actor.log.info(f"Page body preview: {body_text}")
-                    link_count = await context.page.evaluate('''() => {
-                        const links = document.querySelectorAll('a[href*="sdbullion"]');
-                        return { total: links.length, samples: Array.from(links).slice(0, 5).map(a => a.href) };
-                    }''')
-                    Actor.log.info(f"Links on page: {link_count}")
-                except Exception:
-                    pass
-
-            # Enqueue search pagination if we still need more products
-            if products_scraped < max_items:
-                await context.enqueue_links(
-                    selector='.pages a.next, .pages-items a, [class*="pagination"] a, a.action.next',
-                    label='SEARCH',
-                )
-
-        @router.handler('CATEGORY')
-        async def category_handler(context: PlaywrightCrawlingContext):
-            if products_scraped >= max_items:
-                return
-
-            url = context.request.url
-            Actor.log.info(f'Processing category: {url}')
-
-            await dismiss_overlays(context.page)
-
-            magento_selectors = '.products-grid, .products.list, .product-items'
-            try:
-                await context.page.wait_for_selector(magento_selectors, timeout=15000)
-            except Exception:
-                Actor.log.info("Magento product grid not found on category, scrolling and waiting...")
-                await context.page.evaluate('window.scrollBy(0, 500)')
-                await context.page.wait_for_timeout(5000)
-
-            # Try to extract products directly from the listing page
-            count = await extract_products_from_listing(context, max_items, 'category')
-
-            if count == 0:
-                Actor.log.info("No products extracted from category listing via JS")
-                try:
-                    link_count = await context.page.evaluate('''() => {
-                        const links = document.querySelectorAll('a[href*="sdbullion"]');
-                        return { total: links.length, samples: Array.from(links).slice(0, 5).map(a => a.href) };
-                    }''')
-                    Actor.log.info(f"Links on page: {link_count}")
-                except Exception:
-                    pass
-
-            # Enqueue category pagination if we still need more products
-            if products_scraped < max_items:
-                await context.enqueue_links(
-                    selector='.pages a.next, .pages-items a, [class*="pagination"] a, a.action.next',
-                    label='CATEGORY',
-                )
-
-        @router.default_handler
-        async def default_handler(context: PlaywrightCrawlingContext):
-            url = context.request.url
-            if is_search_url(url):
-                return await search_handler(context)
-            elif is_category_url(url):
-                return await category_handler(context)
-            else:
-                return await product_handler(context)
-
-        concurrency_settings = ConcurrencySettings(
-            max_concurrency=3,
-            min_concurrency=1,
-            desired_concurrency=2,
-        )
-
-        # SD Bullion's WAF blocks datacenter IPs — residential proxies required.
-        # Try user-provided config first; if it doesn't specify residential, force it.
+        # Set up proxy — SD Bullion WAF requires residential proxies
         proxy_input = actor_input.get('proxyConfiguration')
         if proxy_input and proxy_input.get('apifyProxyGroups'):
             Actor.log.info(f"Using user-provided proxy config: {proxy_input}")
@@ -567,87 +379,38 @@ async def main():
                 },
             )
 
-        # Log proxy info for diagnostics
-        if proxy_configuration:
-            try:
-                proxy_url = await proxy_configuration.new_url()
-                # Mask the password in the URL for logging
-                masked = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy_url or '')
-                Actor.log.info(f"Proxy URL (masked): {masked}")
-            except Exception as e:
-                Actor.log.warning(f"Could not get proxy URL: {e}")
+        proxy_url = await proxy_configuration.new_url()
+        masked = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy_url or '')
+        Actor.log.info(f"Proxy URL (masked): {masked}")
+        proxies = {"http": proxy_url, "https": proxy_url}
 
-        crawler = PlaywrightCrawler(
-            request_handler=router,
-            concurrency_settings=concurrency_settings,
-            max_requests_per_crawl=max_items * 5,
-            browser_type='firefox',
-            headless=False,
-            request_handler_timeout=timedelta(seconds=90),
-            proxy_configuration=proxy_configuration,
-        )
+        # Create HTTP session with Chrome TLS fingerprint impersonation.
+        # This bypasses WAF TLS fingerprinting that blocks Playwright browsers.
+        http = Session(impersonate="chrome110")
+        Actor.log.info("Created curl_cffi session with chrome110 TLS impersonation")
 
-        # Monkey-patch: allow 403 responses through instead of treating them
-        # as blocked sessions or HTTP errors. SD Bullion may serve challenge
-        # pages with 403 that resolve after JS execution.
-        _original_session_raise = crawler._raise_for_session_blocked_status_code
-        _original_error_raise = crawler._raise_for_error_status_code
+        # Verify proxy connectivity
+        try:
+            test_resp = http.get("https://httpbin.org/ip", proxies=proxies, timeout=10)
+            Actor.log.info(f"Proxy verification — IP: {test_resp.text.strip()}")
+        except Exception as e:
+            Actor.log.warning(f"Proxy verification failed: {e}")
 
-        def _patched_session_raise(self, session, status_code):
-            if status_code == 403:
-                Actor.log.info(f"Got HTTP 403 — bypassing session block check")
-                return
-            _original_session_raise(session, status_code)
-
-        def _patched_error_raise(self, status_code):
-            if status_code == 403:
-                Actor.log.info(f"Got HTTP 403 — bypassing error status check, allowing page to load")
-                return
-            _original_error_raise(status_code)
-
-        crawler._raise_for_session_blocked_status_code = types.MethodType(_patched_session_raise, crawler)
-        crawler._raise_for_error_status_code = types.MethodType(_patched_error_raise, crawler)
-
-        @crawler.pre_navigation_hook
-        async def stealth_hook(context: PlaywrightCrawlingContext) -> None:
-            """Inject stealth scripts and set realistic headers to reduce bot detection."""
-            # Hide automation fingerprints before page navigates
-            await context.page.add_init_script('''
-                // Hide webdriver flag
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                // Realistic plugins array
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                // Realistic languages
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-                // Hide automation-related Chrome properties
-                if (window.chrome === undefined) {
-                    window.chrome = { runtime: {} };
-                }
-            ''')
-            await context.page.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Upgrade-Insecure-Requests': '1',
-            })
-
-        initial_requests = []
+        # Process start URLs
         for url in start_urls:
-            if is_search_url(url):
-                label = 'SEARCH'
-            elif is_category_url(url):
-                label = 'CATEGORY'
-            else:
-                label = 'PRODUCT'
-            initial_requests.append(Request.from_url(url=url, label=label))
+            if products_scraped >= max_items:
+                break
 
-        await crawler.run(initial_requests)
+            if is_search_url(url) or is_category_url(url):
+                await scrape_listing(http, url, proxies, max_items)
+            elif is_product_url(url):
+                await scrape_product(http, url, proxies, max_items)
+            else:
+                Actor.log.warning(f"Could not classify URL, trying as listing: {url}")
+                await scrape_listing(http, url, proxies, max_items)
+
         Actor.log.info(f'Scraping completed. Total products scraped: {products_scraped}')
+
 
 if __name__ == "__main__":
     asyncio.run(main())

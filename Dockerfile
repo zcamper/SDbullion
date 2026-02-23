@@ -1,5 +1,5 @@
-# Specify the parent image from which we build
-FROM apify/actor-python-playwright:3.10
+# Lighter base image — no browser needed (using curl_cffi for HTTP)
+FROM apify/actor-python:3.10
 
 # Copy all files to the container
 COPY . ./

@@ -530,9 +530,9 @@ async def main():
                 return await product_handler(context)
 
         concurrency_settings = ConcurrencySettings(
-            max_concurrency=5,
-            min_concurrency=2,
-            desired_concurrency=3,
+            max_concurrency=3,
+            min_concurrency=1,
+            desired_concurrency=2,
         )
 
         proxy_input = actor_input.get('proxyConfiguration')
@@ -551,11 +551,22 @@ async def main():
             request_handler=router,
             concurrency_settings=concurrency_settings,
             max_requests_per_crawl=max_items * 5,
-            browser_type='chromium',
-            headless=True,
-            request_handler_timeout=timedelta(seconds=60),
+            browser_type='firefox',
+            headless=False,
+            request_handler_timeout=timedelta(seconds=90),
             proxy_configuration=proxy_configuration,
         )
+
+        @crawler.pre_navigation_hook
+        async def stealth_hook(context: PlaywrightCrawlingContext, go_to_options: dict) -> None:
+            """Set realistic headers and viewport to reduce bot detection."""
+            await context.page.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Upgrade-Insecure-Requests': '1',
+            })
 
         initial_requests = []
         for url in start_urls:

@@ -396,6 +396,22 @@ async def main():
         except Exception as e:
             Actor.log.warning(f"Proxy verification failed: {e}")
 
+        # Warm up session: visit homepage first to establish cookies/session.
+        # Many WAFs require an initial visit to set tracking cookies before
+        # allowing access to deeper pages like search results.
+        Actor.log.info("Warming up session by visiting homepage...")
+        try:
+            home_resp = http.get("https://www.sdbullion.com/", proxies=proxies, timeout=30)
+            Actor.log.info(f"Homepage response: status={home_resp.status_code}, length={len(home_resp.text)}, cookies={len(http.cookies)}")
+            if http.cookies:
+                cookie_names = [c.name for c in http.cookies]
+                Actor.log.info(f"Cookies received: {cookie_names}")
+            # Log what headers curl_cffi actually sends
+            debug_resp = http.get("https://httpbin.org/headers", proxies=proxies, timeout=10)
+            Actor.log.info(f"Request headers being sent: {debug_resp.text.strip()[:500]}")
+        except Exception as e:
+            Actor.log.warning(f"Homepage warm-up failed: {e}")
+
         # Process start URLs
         for url in start_urls:
             if products_scraped >= max_items:

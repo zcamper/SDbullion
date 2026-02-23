@@ -404,15 +404,22 @@ async def main():
                 Actor.log.info(f"Cookies received: {list(cookie_dict.keys())}")
             except Exception:
                 Actor.log.info(f"Cookies (raw): {http.cookies}")
-            # If homepage returned 403, try again (some WAFs need cookie + retry)
-            if home_resp.status_code == 403 and len(http.cookies) > 0:
-                Actor.log.info("Retrying homepage with cookies...")
-                import time
-                time.sleep(2)
-                home_resp2 = http.get("https://www.sdbullion.com/", proxies=proxies, timeout=30)
-                Actor.log.info(f"Homepage retry: status={home_resp2.status_code}, length={len(home_resp2.text)}")
-                if home_resp2.status_code != 403:
-                    Actor.log.info(f"Homepage retry body preview: {home_resp2.text[:300]}")
+            # Set Referer header for all subsequent requests (WAFs check this)
+            http.headers.update({
+                'Referer': 'https://www.sdbullion.com/',
+            })
+            # Diagnostic: test search, category, and product URLs to see which are blocked
+            test_urls = [
+                ("search", "https://www.sdbullion.com/catalogsearch/result/?q=Silver+coin"),
+                ("category", "https://www.sdbullion.com/silver/"),
+                ("product", "https://www.sdbullion.com/2025-1-oz-american-silver-eagle-coin-bu"),
+            ]
+            for label, test_url in test_urls:
+                try:
+                    test_resp = http.get(test_url, proxies=proxies, timeout=15)
+                    Actor.log.info(f"  {label} test: status={test_resp.status_code}, length={len(test_resp.text)}")
+                except Exception as e:
+                    Actor.log.info(f"  {label} test failed: {e}")
         except Exception as e:
             Actor.log.warning(f"Homepage warm-up failed: {e}")
 

@@ -571,17 +571,25 @@ async def main():
         )
 
         # Monkey-patch: allow 403 responses through instead of treating them
-        # as blocked sessions. SD Bullion may serve challenge pages with 403
-        # that resolve after JS execution.
-        _original_raise = crawler._raise_for_session_blocked_status_code
+        # as blocked sessions or HTTP errors. SD Bullion may serve challenge
+        # pages with 403 that resolve after JS execution.
+        _original_session_raise = crawler._raise_for_session_blocked_status_code
+        _original_error_raise = crawler._raise_for_error_status_code
 
-        def _patched_raise(self, session, status_code):
+        def _patched_session_raise(self, session, status_code):
             if status_code == 403:
-                Actor.log.info(f"Got HTTP 403 — allowing through (may be challenge page)")
+                Actor.log.info(f"Got HTTP 403 — bypassing session block check")
                 return
-            _original_raise(session, status_code)
+            _original_session_raise(session, status_code)
 
-        crawler._raise_for_session_blocked_status_code = types.MethodType(_patched_raise, crawler)
+        def _patched_error_raise(self, status_code):
+            if status_code == 403:
+                Actor.log.info(f"Got HTTP 403 — bypassing error status check, allowing page to load")
+                return
+            _original_error_raise(status_code)
+
+        crawler._raise_for_session_blocked_status_code = types.MethodType(_patched_session_raise, crawler)
+        crawler._raise_for_error_status_code = types.MethodType(_patched_error_raise, crawler)
 
         @crawler.pre_navigation_hook
         async def stealth_hook(context: PlaywrightCrawlingContext) -> None:

@@ -549,12 +549,33 @@ async def main():
             desired_concurrency=2,
         )
 
-        # SD Bullion's WAF blocks datacenter IPs — always use residential proxies.
-        # Override any user-provided proxy config to ensure residential group.
-        Actor.log.info("Configuring residential proxy (required for SD Bullion WAF)")
-        proxy_configuration = await Actor.create_proxy_configuration(
-            groups=['RESIDENTIAL'],
-        )
+        # SD Bullion's WAF blocks datacenter IPs — residential proxies required.
+        # Try user-provided config first; if it doesn't specify residential, force it.
+        proxy_input = actor_input.get('proxyConfiguration')
+        if proxy_input and proxy_input.get('apifyProxyGroups'):
+            Actor.log.info(f"Using user-provided proxy config: {proxy_input}")
+            proxy_configuration = await Actor.create_proxy_configuration(
+                actor_proxy_input=proxy_input,
+            )
+        else:
+            Actor.log.info("Forcing RESIDENTIAL proxy with US country (required for SD Bullion WAF)")
+            proxy_configuration = await Actor.create_proxy_configuration(
+                actor_proxy_input={
+                    'useApifyProxy': True,
+                    'apifyProxyGroups': ['RESIDENTIAL'],
+                    'apifyProxyCountry': 'US',
+                },
+            )
+
+        # Log proxy info for diagnostics
+        if proxy_configuration:
+            try:
+                proxy_url = await proxy_configuration.new_url()
+                # Mask the password in the URL for logging
+                masked = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy_url or '')
+                Actor.log.info(f"Proxy URL (masked): {masked}")
+            except Exception as e:
+                Actor.log.warning(f"Could not get proxy URL: {e}")
 
         crawler = PlaywrightCrawler(
             request_handler=router,

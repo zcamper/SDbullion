@@ -11,7 +11,8 @@ from crawlee.errors import SessionError
 from crawlee.router import Router
 
 SDBULLION_HOST = 'sdbullion.com'
-SEARCH_URL_TEMPLATE = 'https://sdbullion.com/catalogsearch/result/?q={query}'
+SDBULLION_HOSTS = {'sdbullion.com', 'www.sdbullion.com'}
+SEARCH_URL_TEMPLATE = 'https://www.sdbullion.com/catalogsearch/result/?q={query}'
 CATEGORY_PATH_KEYWORDS = ['/gold/', '/silver/', '/platinum/', '/palladium/', '/copper/']
 AVAILABILITY_STATES = ['In Stock', 'Out of Stock', 'Pre-Order', 'Sold Out', 'Coming Soon', 'Discontinued']
 MAX_DESCRIPTION_LENGTH = 2000
@@ -46,7 +47,7 @@ EXTRACT_LISTING_PRODUCTS_JS = '''() => {
     // Strategy 2: Generic product grid/list fallbacks
     if (products.length === 0) {
         document.querySelectorAll('.products-grid .product-item, .products.list .product-item, [class*="product"] li, [class*="product-list"] > div').forEach(el => {
-            const link = el.querySelector('a[href*="sdbullion.com"]');
+            const link = el.querySelector('a[href*="sdbullion"]');
             const nameEl = el.querySelector('h2, h3, h4, [class*="name"], [class*="title"], a[class*="link"]');
             const priceEl = el.querySelector('[class*="price"]');
             const imgEl = el.querySelector('img[src], img[data-src]');
@@ -67,7 +68,7 @@ EXTRACT_LISTING_PRODUCTS_JS = '''() => {
 
     // Strategy 3: Any product link with price nearby
     if (products.length === 0) {
-        document.querySelectorAll('a[href*="sdbullion.com"]').forEach(link => {
+        document.querySelectorAll('a[href*="sdbullion"]').forEach(link => {
             const url = link.href;
             const name = (link.innerText || link.title || '').trim();
             if (name && name.length > 5 && !seen.has(url) && !url.includes('/catalogsearch/') && !url.includes('/checkout/') && !url.includes('/customer/')) {
@@ -165,7 +166,7 @@ def validate_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
         host = parsed.hostname or ''
-        return parsed.scheme in ('http', 'https') and (host == SDBULLION_HOST or host == f'www.{SDBULLION_HOST}')
+        return parsed.scheme in ('http', 'https') and host in SDBULLION_HOSTS
     except Exception:
         return False
 
@@ -479,7 +480,7 @@ async def main():
                     body_text = await context.page.evaluate('() => document.body.innerText.substring(0, 500)')
                     Actor.log.info(f"Page body preview: {body_text}")
                     link_count = await context.page.evaluate('''() => {
-                        const links = document.querySelectorAll('a[href*="sdbullion.com"]');
+                        const links = document.querySelectorAll('a[href*="sdbullion"]');
                         return { total: links.length, samples: Array.from(links).slice(0, 5).map(a => a.href) };
                     }''')
                     Actor.log.info(f"Links on page: {link_count}")
@@ -518,7 +519,7 @@ async def main():
                 Actor.log.info("No products extracted from category listing via JS")
                 try:
                     link_count = await context.page.evaluate('''() => {
-                        const links = document.querySelectorAll('a[href*="sdbullion.com"]');
+                        const links = document.querySelectorAll('a[href*="sdbullion"]');
                         return { total: links.length, samples: Array.from(links).slice(0, 5).map(a => a.href) };
                     }''')
                     Actor.log.info(f"Links on page: {link_count}")
@@ -548,17 +549,12 @@ async def main():
             desired_concurrency=2,
         )
 
-        proxy_input = actor_input.get('proxyConfiguration')
-        if proxy_input:
-            proxy_configuration = await Actor.create_proxy_configuration(
-                actor_proxy_input=proxy_input,
-            )
-        else:
-            # Default: use Apify proxy to avoid blocking
-            Actor.log.info("No proxy configuration provided, using default Apify proxy with residential group")
-            proxy_configuration = await Actor.create_proxy_configuration(
-                groups=['RESIDENTIAL'],
-            )
+        # SD Bullion's WAF blocks datacenter IPs — always use residential proxies.
+        # Override any user-provided proxy config to ensure residential group.
+        Actor.log.info("Configuring residential proxy (required for SD Bullion WAF)")
+        proxy_configuration = await Actor.create_proxy_configuration(
+            groups=['RESIDENTIAL'],
+        )
 
         crawler = PlaywrightCrawler(
             request_handler=router,

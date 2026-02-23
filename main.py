@@ -558,7 +558,7 @@ async def main():
         )
 
         @crawler.pre_navigation_hook
-        async def stealth_hook(context: PlaywrightCrawlingContext, go_to_options: dict) -> None:
+        async def stealth_hook(context: PlaywrightCrawlingContext) -> None:
             """Set realistic headers and viewport to reduce bot detection."""
             await context.page.set_extra_http_headers({
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',

@@ -1,11 +1,13 @@
 import asyncio
 import re
+import types
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, urlparse
 
 from apify import Actor
 from crawlee import ConcurrencySettings, Request
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.errors import SessionError
 from crawlee.router import Router
 
 SDBULLION_HOST = 'sdbullion.com'
@@ -434,6 +436,17 @@ async def main():
             url = context.request.url
             Actor.log.info(f'Processing search results: {url}')
 
+            # Log response status and page title for diagnostics
+            try:
+                title = await context.page.title()
+                page_url = context.page.url
+                Actor.log.info(f"Page loaded — title: '{title}', final URL: {page_url}")
+                # Log first 300 chars of body text to see what we got
+                preview = await context.page.evaluate('() => document.body ? document.body.innerText.substring(0, 300) : "NO BODY"')
+                Actor.log.info(f"Page body preview (first 300 chars): {preview}")
+            except Exception as e:
+                Actor.log.warning(f"Could not get page diagnostics: {e}")
+
             # Dismiss cookie consent / overlays that may block rendering
             await dismiss_overlays(context.page)
 
@@ -557,9 +570,39 @@ async def main():
             proxy_configuration=proxy_configuration,
         )
 
+        # Monkey-patch: allow 403 responses through instead of treating them
+        # as blocked sessions. SD Bullion may serve challenge pages with 403
+        # that resolve after JS execution.
+        _original_raise = crawler._raise_for_session_blocked_status_code
+
+        def _patched_raise(self, session, status_code):
+            if status_code == 403:
+                Actor.log.info(f"Got HTTP 403 — allowing through (may be challenge page)")
+                return
+            _original_raise(session, status_code)
+
+        crawler._raise_for_session_blocked_status_code = types.MethodType(_patched_raise, crawler)
+
         @crawler.pre_navigation_hook
         async def stealth_hook(context: PlaywrightCrawlingContext) -> None:
-            """Set realistic headers and viewport to reduce bot detection."""
+            """Inject stealth scripts and set realistic headers to reduce bot detection."""
+            # Hide automation fingerprints before page navigates
+            await context.page.add_init_script('''
+                // Hide webdriver flag
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                // Realistic plugins array
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                // Realistic languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                // Hide automation-related Chrome properties
+                if (window.chrome === undefined) {
+                    window.chrome = { runtime: {} };
+                }
+            ''')
             await context.page.set_extra_http_headers({
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
